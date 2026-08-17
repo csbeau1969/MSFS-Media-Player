@@ -64,6 +64,7 @@ internal sealed class SimConnectBridge : IDisposable
     private const string LVAR_STATION_COUNT = "L:MEDIAPLAYER_STATION_COUNT";
     private const string LVAR_STN_PREFIX = "L:MEDIAPLAYER_STN";
     private string[] _stationNames = Array.Empty<string>();
+    private string _npText = "";
 
     private bool _lvarsReady;
 
@@ -73,6 +74,16 @@ internal sealed class SimConnectBridge : IDisposable
     // finishes zeroing the L:vars (the immediate re-push would then be wiped).
     private readonly System.Windows.Forms.Timer _repushTimer;
     private int _repushesLeft;
+    // Re-binds the L:var data definitions while they can't be reaching the EFB. A definition binds
+    // to the L:var when AddToDataDefinition runs; if the var doesn't exist yet (EFB tablet not open),
+    // that definition stays dead for the rest of the session — re-writing it later can't help, only
+    // re-defining can. See RebindTick.
+    private readonly System.Windows.Forms.Timer _rebindTimer;
+    // Set by OnException when a def/write bounced (UNRECOGNIZED_ID): our definitions are stale.
+    private bool _writesRejected;
+    private readonly HashSet<int> _definedIds = new();
+    // Throttles the "sim not running" log so a whole day of retries doesn't fill the file.
+    private DateTime _lastConnectFailLog = DateTime.MinValue;
     // Latches once the EFB app announces itself (its first volume write). On a cold start the EFB
     // tablet may open well after the companion connects — until it does, L:vars don't exist and our
     // writes bounce (UNRECOGNIZED_ID). Re-push when the EFB first appears so the list always lands.
@@ -108,6 +119,8 @@ internal sealed class SimConnectBridge : IDisposable
         _reconnectTimer.Tick += (_, _) => TryConnect();
         _repushTimer = new System.Windows.Forms.Timer { Interval = 1500 };
         _repushTimer.Tick += (_, _) => RepushTick();
+        _rebindTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+        _rebindTimer.Tick += (_, _) => RebindTick();
     }
 
     public void Start()
@@ -129,10 +142,17 @@ internal sealed class SimConnectBridge : IDisposable
             _sc.OnRecvEvent += OnEvent;
             Log.Info("SimConnect: attempting connection");
         }
-        catch (COMException)
+        catch (COMException ex)
         {
-            // Sim not running yet — swallow; the reconnect timer will retry.
+            // Sim not running yet — the reconnect timer will retry. Log at most once a minute, so a
+            // "the sim IS running and we still never connect" case is visible in the log instead of
+            // looking identical to "the sim was never started".
             _sc = null;
+            if ((DateTime.Now - _lastConnectFailLog).TotalMinutes >= 1)
+            {
+                _lastConnectFailLog = DateTime.Now;
+                Log.Info($"SimConnect: no sim yet (0x{ex.HResult:X8}) — retrying every 3s");
+            }
         }
         catch (Exception ex)
         {
@@ -151,6 +171,7 @@ internal sealed class SimConnectBridge : IDisposable
         ConnectionChanged?.Invoke(true);
         SetupAdfProbes();
         SetupLvars();
+        _rebindTimer.Start();
         try { sender.SubscribeToSystemEvent(SysEvent.FlightLoaded, "FlightLoaded"); }
         catch (Exception ex) { Log.Warn($"FlightLoaded subscribe failed: {ex.Message}"); }
     }
@@ -162,8 +183,26 @@ internal sealed class SimConnectBridge : IDisposable
     private void OnEvent(SimConnect sender, SIMCONNECT_RECV_EVENT data)
     {
         if ((SysEvent)data.uEventID != SysEvent.FlightLoaded) return;
-        Log.Info("SimConnect: FlightLoaded — re-pushing bridge state");
+        Log.Info("SimConnect: FlightLoaded — re-binding definitions and re-pushing bridge state");
+        SetupLvars();       // MSFS drops the L:vars on flight load; the old definitions go stale
         ScheduleRepushes();
+    }
+
+    /// <summary>
+    /// Periodic recovery while the bridge can't be reaching the EFB. A SimConnect data definition
+    /// binds to its L:var when AddToDataDefinition runs — if the var doesn't exist yet (the EFB
+    /// tablet app creates ours, and the user may open it minutes into the flight, or never), the
+    /// definition is dead for the rest of the session and every later write bounces with
+    /// UNRECOGNIZED_ID. Re-writing can't fix that; re-defining can. So: while the EFB hasn't
+    /// announced itself, or while writes are being rejected, rebuild all definitions and push again.
+    /// </summary>
+    private void RebindTick()
+    {
+        if (_sc is null || !Connected) return;
+        if (_efbSeen && !_writesRejected) return; // bridge is live — nothing to repair
+        _writesRejected = false;
+        SetupLvars();
+        RepushBridgeState();
     }
 
     /// <summary>
@@ -189,12 +228,16 @@ internal sealed class SimConnectBridge : IDisposable
     private void RepushBridgeState()
     {
         if (!_lvarsReady) return;
-        _lastNp = "";                                         // force NP re-push on next poll
         WriteStationList();                                   // re-push station list
         WriteLvar(DEF_STATUS_GATE, _gate >= 0.5f ? 1 : 0);   // re-push current gate
+        WritePackedString(DEF_NP_BASE, NP_SLOTS, _npText);   // re-push current now-playing text
     }
 
-    /// <summary>P4: register the EFB command/volume reads and the status writes.</summary>
+    /// <summary>
+    /// P4: (re)register the EFB command/volume reads and the status writes. Safe to call repeatedly —
+    /// each definition is cleared before it is rebuilt, which re-binds it to an L:var that has since
+    /// come into existence (see RebindTick).
+    /// </summary>
     private void SetupLvars()
     {
         if (_sc is null) return;
@@ -202,11 +245,9 @@ internal sealed class SimConnectBridge : IDisposable
         {
             // Reads — request on change.
             DefineLvar(DEF_CMD, LVAR_CMD);
-            _sc.RequestDataOnSimObject((Request)DEF_CMD, (Define)DEF_CMD, SimConnect.SIMCONNECT_OBJECT_ID_USER,
-                SIMCONNECT_PERIOD.SECOND, SIMCONNECT_DATA_REQUEST_FLAG.CHANGED, 0, 0, 0);
+            RequestOnChange(DEF_CMD, LVAR_CMD);
             DefineLvar(DEF_VOL, LVAR_VOL);
-            _sc.RequestDataOnSimObject((Request)DEF_VOL, (Define)DEF_VOL, SimConnect.SIMCONNECT_OBJECT_ID_USER,
-                SIMCONNECT_PERIOD.SECOND, SIMCONNECT_DATA_REQUEST_FLAG.CHANGED, 0, 0, 0);
+            RequestOnChange(DEF_VOL, LVAR_VOL);
 
             // Writes — define only (pushed via SetDataOnSimObject).
             DefineLvar(DEF_STATUS_RADIO_PLAYING, LVAR_RADIO_PLAYING);
@@ -218,11 +259,12 @@ internal sealed class SimConnectBridge : IDisposable
             for (int n = 0; n < MAX_STATIONS_TX * NAME_SLOTS; n++)
                 DefineLvar(DEF_STATION_BASE + n, $"{LVAR_STN_PREFIX}{n}");
 
+            bool first = !_lvarsReady;
             _lvarsReady = true;
             // Push state now and a few more times: on first start the companion often connects while
             // the flight is still loading, and MSFS keeps zeroing L:vars past the first write.
             ScheduleRepushes();
-            Log.Info("SimConnect: LVAR bridge ready");
+            if (first) Log.Info("SimConnect: LVAR bridge ready");
         }
         catch (Exception ex)
         {
@@ -232,9 +274,42 @@ internal sealed class SimConnectBridge : IDisposable
 
     private void DefineLvar(int id, string name)
     {
+        if (_definedIds.Contains(id))
+        {
+            // Rebinding: the old definition may point at an L:var that didn't exist when it was made.
+            try { _sc!.ClearDataDefinition((Define)id); }
+            catch (Exception ex) { Log.Warn($"ClearDataDefinition {id} ({name}) failed: {ex.Message}"); }
+        }
         _sc!.AddToDataDefinition((Define)id, name, "number", SIMCONNECT_DATATYPE.FLOAT64,
             0f, SimConnect.SIMCONNECT_UNUSED);
+        Tag($"define {name}");
         _sc.RegisterDataDefineStruct<DoubleData>((Define)id);
+        _definedIds.Add(id);
+    }
+
+    private void RequestOnChange(int id, string name)
+    {
+        _sc!.RequestDataOnSimObject((Request)id, (Define)id, SimConnect.SIMCONNECT_OBJECT_ID_USER,
+            SIMCONNECT_PERIOD.SECOND, SIMCONNECT_DATA_REQUEST_FLAG.CHANGED, 0, 0, 0);
+        Tag($"request {name}");
+    }
+
+    // SimConnect reports errors asynchronously with only the id of the packet that caused them, so
+    // remember what each recent packet was; without this an UNRECOGNIZED_ID says nothing about which
+    // L:var failed. Bounded — only the newest few hundred packets matter.
+    private readonly Dictionary<uint, string> _sendTags = new();
+    private readonly Queue<uint> _sendOrder = new();
+
+    private void Tag(string what)
+    {
+        try
+        {
+            uint id = _sc!.GetLastSentPacketID();
+            _sendTags[id] = what;
+            _sendOrder.Enqueue(id);
+            while (_sendOrder.Count > 400) _sendTags.Remove(_sendOrder.Dequeue());
+        }
+        catch { /* diagnostics only */ }
     }
 
     /// <summary>EFB → companion radio status.</summary>
@@ -253,6 +328,7 @@ internal sealed class SimConnectBridge : IDisposable
     /// </summary>
     public void SetNowPlayingText(string text)
     {
+        _npText = text;                 // kept so a re-push can restore it without a track change
         if (text == _lastNp) return;
         _lastNp = text;
         Log.Info($"NP text → '{text}' (lvarsReady={_lvarsReady})");
@@ -271,6 +347,7 @@ internal sealed class SimConnectBridge : IDisposable
         WriteLvar(DEF_STATION_COUNT, _stationNames.Length);
         for (int i = 0; i < _stationNames.Length; i++)
             WritePackedString(DEF_STATION_BASE + i * NAME_SLOTS, NAME_SLOTS, _stationNames[i]);
+        Log.Info($"Station list pushed to EFB ({_stationNames.Length} stations, efbSeen={_efbSeen})");
     }
 
     /// <summary>Pack a string into <paramref name="slots"/> consecutive LVAR defs, 6 Latin-1 chars each.</summary>
@@ -299,6 +376,7 @@ internal sealed class SimConnectBridge : IDisposable
         {
             _sc.SetDataOnSimObject((Define)defId, SimConnect.SIMCONNECT_OBJECT_ID_USER,
                 SIMCONNECT_DATA_SET_FLAG.DEFAULT, new DoubleData { Value = value });
+            Tag($"write def {defId}");
         }
         catch (Exception ex)
         {
@@ -352,8 +430,11 @@ internal sealed class SimConnectBridge : IDisposable
             if (!_efbSeen)
             {
                 _efbSeen = true;
-                Log.Info("EFB detected (volume write) — re-pushing bridge state");
-                ScheduleRepushes();
+                // The tablet is open, so every bridge L:var exists now. Rebind the definitions that
+                // were made while it was closed (they bound to nothing) and then push.
+                Log.Info("EFB detected (volume write) — re-binding definitions and re-pushing state");
+                SetupLvars();
+                RepushBridgeState();
             }
             return;
         }
@@ -397,6 +478,12 @@ internal sealed class SimConnectBridge : IDisposable
     private void OnException(SimConnect sender, SIMCONNECT_RECV_EXCEPTION data)
     {
         var ex = (SIMCONNECT_EXCEPTION)data.dwException;
+        // A rejected define/write means our definitions no longer point at live L:vars — schedule a
+        // rebind (RebindTick) rather than pushing into the void for the rest of the session.
+        if (ex is SIMCONNECT_EXCEPTION.UNRECOGNIZED_ID or SIMCONNECT_EXCEPTION.INVALID_DATA_TYPE
+            or SIMCONNECT_EXCEPTION.DATA_ERROR or SIMCONNECT_EXCEPTION.ERROR)
+            _writesRejected = true;
+
         if (ex == _lastException)
         {
             _lastExceptionRepeat++;
@@ -406,7 +493,8 @@ internal sealed class SimConnectBridge : IDisposable
             Log.Warn($"SimConnect exception: {_lastException} (repeated ×{_lastExceptionRepeat})");
         _lastException = ex;
         _lastExceptionRepeat = 0;
-        Log.Warn($"SimConnect exception: {ex}");
+        string what = _sendTags.TryGetValue(data.dwSendID, out var tag) ? tag : $"sendID {data.dwSendID}";
+        Log.Warn($"SimConnect exception: {ex} on [{what}]");
     }
 
     private void HandleMessage(ref Message m)
@@ -426,6 +514,12 @@ internal sealed class SimConnectBridge : IDisposable
         Connected = false;
         _lvarsReady = false;
         _efbSeen = false;
+        _writesRejected = false;
+        _definedIds.Clear();
+        _sendTags.Clear();
+        _sendOrder.Clear();
+        _rebindTimer.Stop();
+        _repushTimer.Stop();
         try { _sc?.Dispose(); } catch { /* best effort */ }
         _sc = null;
         if (wasConnected)
@@ -444,6 +538,8 @@ internal sealed class SimConnectBridge : IDisposable
         _reconnectTimer.Dispose();
         _repushTimer.Stop();
         _repushTimer.Dispose();
+        _rebindTimer.Stop();
+        _rebindTimer.Dispose();
         Disconnect();
         _window.ReleaseHandle();
     }

@@ -94,6 +94,33 @@ export function readStations(): string[] {
   return names;
 }
 
+/**
+ * Create every LVAR the companion writes to us, by writing 0 into it once at startup.
+ *
+ * A SimConnect data definition binds to its LVAR when the client defines it. The companion defines
+ * ours the moment it connects to the sim — usually long before this tablet app is opened, when
+ * none of these LVARs exist yet — so those definitions bind to nothing and every station-list write
+ * bounces (UNRECOGNIZED_ID) for the rest of the session. Writing them here makes them exist, and
+ * the companion re-binds when it sees our volume write.
+ *
+ * Only writes vars that currently read 0, so re-opening the app can't wipe a list already pushed.
+ */
+export function ensureBridgeVars(): void {
+  const names = [
+    LVar.RadioPlaying,
+    LVar.RadioIdx,
+    LVar.Gate,
+    LVar.LocalPlaying,
+    "L:MEDIAPLAYER_STATION_COUNT",
+  ];
+  for (let i = 0; i < NP_SLOTS; i++) names.push(`L:MEDIAPLAYER_NP${i}`);
+  for (let i = 0; i < MAX_STATIONS * NAME_SLOTS; i++) names.push(`L:MEDIAPLAYER_STN${i}`);
+
+  for (const name of names) {
+    if (SimVar.GetSimVarValue(name, NUMBER) === 0) SimVar.SetSimVarValue(name, NUMBER, 0);
+  }
+}
+
 export interface MediaStatus {
   radioPlaying: boolean;
   radioIdx: number;

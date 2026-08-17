@@ -1,6 +1,7 @@
 import { Button, GamepadUiView, RequiredProps, Slider, TTButton, TVNode, UiViewProps } from "@efb/efb-api";
 import { FSComponent, MappedSubject, Subject, VNode } from "@microsoft/msfs-sdk";
 import {
+  ensureBridgeVars,
   localNext,
   localPlayPause,
   localPrev,
@@ -52,6 +53,9 @@ export class MediaControlPage extends GamepadUiView<HTMLDivElement, MediaControl
 
   public onAfterRender(node: VNode): void {
     super.onAfterRender(node);
+    // Order matters: the LVARs must exist before the companion reacts to our volume write by
+    // re-binding its data definitions to them.
+    ensureBridgeVars();
     setRadioVolume(this.volume.get());
     this.nowPlaying.sub(() => this.updateMarquee());
     this.pollHandle = window.setInterval(() => this.poll(), 300);
